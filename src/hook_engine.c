@@ -1,10 +1,9 @@
 /* ============================================================================
- * hook_engine.c - Hook 引擎实现
+ * hook_engine.c - Hook 引擎实现 (修复版)
  * ============================================================================
- * 版本: 3.0.0
- * 描述: 管理系统调用 hook 的安装和卸载
- *       使用 KernelPatch 的 fp_hook_syscalln API
- *       统一的 after handler 将事件转发给 syscall_monitor
+ * 版本: 3.1.0
+ * 修复: hook_install_all 限制最大 hook 数量
+ *       添加已 hook 去重检查
  * ============================================================================ */
 
 #include <compiler.h>
@@ -13,11 +12,9 @@
 #include <linux/string.h>
 #include <syscall.h>
 #include "svc_tracer.h"
-#include "hook_engine.h"
 
 /* --------------------------------------------------------------------------
- * 系统调用号定义 (ARM64 / AArch64)
- * 参考: linux/arch/arm64/include/asm/unistd.h
+ * 系统调用号定义 (ARM64)
  * -------------------------------------------------------------------------- */
 #define __NR_eventfd2       19
 #define __NR_epoll_create1  20
@@ -67,13 +64,10 @@
 #define __NR_renameat2      276
 
 /* --------------------------------------------------------------------------
- * g_hooks - 预定义的 syscall hook 表
- * --------------------------------------------------------------------------
- * 每个条目: { syscall_nr, 参数数量, 名称, 类别 }
- * 参数数量决定使用 fp_hook_syscalln 的 n 值
+ * g_hooks - 预定义 hook 表
  * -------------------------------------------------------------------------- */
 static struct syscall_hook_def g_hooks[] = {
-    /* === 文件操作 === */
+    /* 文件操作 */
     { __NR_openat,      4, "openat",      SC_CAT_FILE },
     { __NR_close,       1, "close",       SC_CAT_FILE },
     { __NR_read,        3, "read",        SC_CAT_FILE },
@@ -92,7 +86,7 @@ static struct syscall_hook_def g_hooks[] = {
     { __NR_mkdirat,     3, "mkdirat",     SC_CAT_FILE },
     { __NR_renameat2,   5, "renameat2",   SC_CAT_FILE },
 
-    /* === 进程操作 === */
+    /* 进程操作 */
     { __NR_execve,      3, "execve",      SC_CAT_PROC },
     { __NR_clone,       5, "clone",       SC_CAT_PROC },
     { __NR_wait4,       4, "wait4",       SC_CAT_PROC },
@@ -102,14 +96,14 @@ static struct syscall_hook_def g_hooks[] = {
     { __NR_prctl,       5, "prctl",       SC_CAT_PROC },
     { __NR_setpgid,     2, "setpgid",     SC_CAT_PROC },
 
-    /* === 内存操作 === */
+    /* 内存操作 */
     { __NR_mmap,        6, "mmap",        SC_CAT_MEM },
     { __NR_munmap,      2, "munmap",      SC_CAT_MEM },
     { __NR_mprotect,    3, "mprotect",    SC_CAT_MEM },
     { __NR_madvise,     3, "madvise",     SC_CAT_MEM },
     { __NR_mremap,      5, "mremap",      SC_CAT_MEM },
 
-    /* === 网络操作 === */
+    /* 网络操作 */
     { __NR_socket,      3, "socket",      SC_CAT_NET },
     { __NR_connect,     3, "connect",     SC_CAT_NET },
     { __NR_bind,        3, "bind",        SC_CAT_NET },
@@ -120,13 +114,13 @@ static struct syscall_hook_def g_hooks[] = {
     { __NR_setsockopt,  5, "setsockopt",  SC_CAT_NET },
     { __NR_getsockname, 3, "getsockname", SC_CAT_NET },
 
-    /* === 信号/调试操作 === */
+    /* 信号/调试 */
     { __NR_ptrace,      4, "ptrace",      SC_CAT_ANTIDEBUG },
     { __NR_rt_sigaction, 4, "rt_sigaction", SC_CAT_SIGNAL },
     { __NR_kill,        2, "kill",        SC_CAT_SIGNAL },
     { __NR_tgkill,      3, "tgkill",      SC_CAT_SIGNAL },
 
-    /* === IPC 操作 === */
+    /* IPC */
     { __NR_epoll_create1, 1, "epoll_create1", SC_CAT_IPC },
     { __NR_epoll_ctl,     4, "epoll_ctl",     SC_CAT_IPC },
     { __NR_eventfd2,      2, "eventfd2",      SC_CAT_IPC },
@@ -135,36 +129,27 @@ static struct syscall_hook_def g_hooks[] = {
 #define NUM_SLIM_HOOKS (sizeof(g_hooks) / sizeof(g_hooks[0]))
 
 /* --------------------------------------------------------------------------
- * hook 用户数据 - 传递给回调函数
+ * hook 用户数据
  * -------------------------------------------------------------------------- */
 struct hook_udata {
-    int nr;     /* syscall 号 */
-    int narg;   /* 参数数量 */
+    int nr;
+    int narg;
 };
 
-/* 每个 hook 的用户数据 (静态分配, 最大支持 512 个 hook) */
-#define MAX_HOOK_SLOTS 512
+#define MAX_HOOK_SLOTS 256  /* 修复: 从 512 减到 256 */
 static struct hook_udata g_udata[MAX_HOOK_SLOTS];
+static int g_hooked_nrs[MAX_HOOK_SLOTS]; /* 已 hook 的 syscall 号, 用于去重 */
 static int g_hook_count = 0;
 static int g_initialized = 0;
 
 /* --------------------------------------------------------------------------
  * after 回调函数
- * --------------------------------------------------------------------------
- * KernelPatch 的 fp_hook_syscalln API 根据参数数量使用不同的回调签名:
- *   fp_hook_syscall0 -> hook_fargs0_t (无参数字段)
- *   fp_hook_syscall1 -> hook_fargs1_t (arg0)
- *   fp_hook_syscall2 -> hook_fargs2_t (arg0, arg1)
- *   ... 最多到 hook_fargs6_t
- *
- * 我们为每种参数数量定义独立的 after handler,
- * 内部统一调用 syscall_monitor_on_syscall
  * -------------------------------------------------------------------------- */
 
 static void after0(hook_fargs0_t *args, void *udata)
 {
     struct hook_udata *ud = (struct hook_udata *)udata;
-    unsigned long sysargs[6] = {0, 0, 0, 0, 0, 0};
+    unsigned long sysargs[6] = {0};
     syscall_monitor_on_syscall(ud->nr, sysargs, args->ret, ud->narg);
 }
 
@@ -219,7 +204,20 @@ static void after6(hook_fargs6_t *args, void *udata)
 }
 
 /* --------------------------------------------------------------------------
- * install_single_hook - 安装单个 syscall hook
+ * is_already_hooked - 去重检查
+ * -------------------------------------------------------------------------- */
+static int is_already_hooked(int nr)
+{
+    int i;
+    for (i = 0; i < g_hook_count; i++) {
+        if (g_hooked_nrs[i] == nr)
+            return 1;
+    }
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * install_single_hook
  * -------------------------------------------------------------------------- */
 static int install_single_hook(int nr, int narg)
 {
@@ -227,7 +225,17 @@ static int install_single_hook(int nr, int narg)
     struct hook_udata *ud;
 
     if (g_hook_count >= MAX_HOOK_SLOTS) {
-        pr_warn("[svc-tracer] hook slots full\n");
+        pr_warn("[svc-tracer] hook slots full (%d)\n", MAX_HOOK_SLOTS);
+        return -1;
+    }
+
+    /* 去重: 不重复 hook 同一个 syscall */
+    if (is_already_hooked(nr))
+        return 0;
+
+    /* 参数数量合法性检查 */
+    if (narg < 0 || narg > 6) {
+        pr_warn("[svc-tracer] invalid narg %d for nr %d\n", narg, nr);
         return -1;
     }
 
@@ -235,46 +243,30 @@ static int install_single_hook(int nr, int narg)
     ud->nr = nr;
     ud->narg = narg;
 
-    /* 根据参数数量选择对应的 hook API 和回调 */
     switch (narg) {
-    case 0:
-        ret = fp_hook_syscalln(nr, 0, NULL, (void *)after0, (void *)ud);
-        break;
-    case 1:
-        ret = fp_hook_syscalln(nr, 1, NULL, (void *)after1, (void *)ud);
-        break;
-    case 2:
-        ret = fp_hook_syscalln(nr, 2, NULL, (void *)after2, (void *)ud);
-        break;
-    case 3:
-        ret = fp_hook_syscalln(nr, 3, NULL, (void *)after3, (void *)ud);
-        break;
-    case 4:
-        ret = fp_hook_syscalln(nr, 4, NULL, (void *)after4, (void *)ud);
-        break;
-    case 5:
-        ret = fp_hook_syscalln(nr, 5, NULL, (void *)after5, (void *)ud);
-        break;
-    case 6:
-        ret = fp_hook_syscalln(nr, 6, NULL, (void *)after6, (void *)ud);
-        break;
-    default:
-        pr_warn("[svc-tracer] unsupported narg %d for nr %d\n", narg, nr);
-        return -1;
+    case 0: ret = fp_hook_syscalln(nr, 0, NULL, (void *)after0, (void *)ud); break;
+    case 1: ret = fp_hook_syscalln(nr, 1, NULL, (void *)after1, (void *)ud); break;
+    case 2: ret = fp_hook_syscalln(nr, 2, NULL, (void *)after2, (void *)ud); break;
+    case 3: ret = fp_hook_syscalln(nr, 3, NULL, (void *)after3, (void *)ud); break;
+    case 4: ret = fp_hook_syscalln(nr, 4, NULL, (void *)after4, (void *)ud); break;
+    case 5: ret = fp_hook_syscalln(nr, 5, NULL, (void *)after5, (void *)ud); break;
+    case 6: ret = fp_hook_syscalln(nr, 6, NULL, (void *)after6, (void *)ud); break;
     }
 
     if (ret == 0) {
+        g_hooked_nrs[g_hook_count] = nr;
         g_hook_count++;
         g_stats.hook_count = g_hook_count;
     } else {
-        pr_warn("[svc-tracer] failed to hook syscall %d: %d\n", nr, ret);
+        /* hook 失败不是致命错误, 某些 syscall 号可能不存在 */
+        pr_info("[svc-tracer] skip hook syscall %d: ret=%d\n", nr, ret);
     }
 
     return ret;
 }
 
 /* ============================================================================
- * 公共接口实现
+ * 公共接口
  * ============================================================================ */
 
 int hook_engine_init(void)
@@ -282,6 +274,7 @@ int hook_engine_init(void)
     g_hook_count = 0;
     g_initialized = 1;
     memset(g_udata, 0, sizeof(g_udata));
+    memset(g_hooked_nrs, 0, sizeof(g_hooked_nrs));
     pr_info("[svc-tracer] hook engine initialized, %lu slim hooks defined\n",
             (unsigned long)NUM_SLIM_HOOKS);
     return 0;
@@ -290,8 +283,7 @@ int hook_engine_init(void)
 void hook_engine_destroy(void)
 {
     /*
-     * KernelPatch 在模块卸载时自动移除所有 hook,
-     * 此处仅重置内部状态
+     * KernelPatch 在模块卸载时自动移除所有 hook
      */
     g_hook_count = 0;
     g_stats.hook_count = 0;
@@ -299,7 +291,6 @@ void hook_engine_destroy(void)
     pr_info("[svc-tracer] hook engine destroyed\n");
 }
 
-/* install_slim: 安装 g_hooks 表中预定义的 syscall hook */
 int hook_install_slim(void)
 {
     int i, count = 0;
@@ -316,19 +307,20 @@ int hook_install_slim(void)
     return count;
 }
 
-/* install_all: 安装 0 ~ __NR_syscalls 范围的所有 syscall hook */
+/*
+ * 修复: hook_install_all 只 hook 有意义的 syscall 号范围
+ * ARM64 Linux 最大 syscall 号约 ~450, 限制到 300 以内
+ * 且只使用 slim hook 表中已知的参数数量
+ */
 int hook_install_all(void)
 {
     int nr, count = 0;
+    int max_nr = 300; /* 修复: 限制范围 */
 
     if (!g_initialized) return -1;
 
-    /*
-     * 遍历所有 syscall 号, 默认按 6 参数 hook
-     * 对已知的 syscall 使用精确参数数量
-     */
-    for (nr = 0; nr < 512; nr++) {
-        int narg = 6; /* 默认最大参数 */
+    for (nr = 0; nr < max_nr; nr++) {
+        int narg = -1;
         int i;
 
         /* 查找精确参数数量 */
@@ -339,6 +331,10 @@ int hook_install_all(void)
             }
         }
 
+        /* 只 hook 有已知参数数量的 syscall, 或使用 6 参数默认值 */
+        if (narg < 0)
+            narg = 6;
+
         if (install_single_hook(nr, narg) == 0)
             count++;
     }
@@ -347,13 +343,12 @@ int hook_install_all(void)
     return count;
 }
 
-/* install_range: 安装 0 ~ max_nr 范围的 syscall hook */
 int hook_install_range(int max_nr)
 {
     int nr, count = 0;
 
     if (!g_initialized) return -1;
-    if (max_nr <= 0 || max_nr > 512) max_nr = 512;
+    if (max_nr <= 0 || max_nr > 300) max_nr = 300; /* 修复: 限制范围 */
 
     for (nr = 0; nr < max_nr; nr++) {
         int narg = 6;

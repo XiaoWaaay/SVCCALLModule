@@ -1,12 +1,12 @@
 /* ============================================================================
- * syscall_monitor.c - Syscall 监控核心实现
+ * syscall_monitor.c - Syscall 监控核心实现 (修复版)
  * ============================================================================
- * 版本: 3.0.0
- * 描述: 系统调用事件处理核心逻辑
- *       - 多级进程过滤 (PID -> UID -> comm -> package)
- *       - Syscall 类别分类
- *       - 反调试行为检测
- *       - 参数解析与事件构建
+ * 版本: 3.1.0
+ * 修复: 1. 使用 safe_get_xxx() 替代未定义的 task_struct_offset
+ *       2. 使用 safe_get_task_comm() 替代未定义的 get_task_comm()
+ *       3. 使用 kp_malloc 分配 svc_event 避免栈溢出
+ *       4. 添加递归 hook 保护 (防止 hook 回调中的 syscall 被再次 hook)
+ *       5. copy_from_user 前增加空指针检查
  * ============================================================================ */
 
 #include <compiler.h>
@@ -16,13 +16,11 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/kernel.h>
-#include <asm/current.h>
-#include <linux/sched.h>
-#include <linux/cred.h>
+#include <kpmalloc.h>
 #include "svc_tracer.h"
 
 /* --------------------------------------------------------------------------
- * 全局配置与统计 (其他模块通过 extern 引用)
+ * 全局配置与统计
  * -------------------------------------------------------------------------- */
 struct tracer_config g_config = {
     .running             = 0,
@@ -34,7 +32,7 @@ struct tracer_config g_config = {
     .filtered_syscall_count = 0,
     .capture_args        = 1,
     .capture_caller      = 1,
-    .capture_backtrace   = 0,
+    .capture_backtrace   = 0,   /* 默认关闭回溯, 避免性能问题 */
     .capture_retval      = 1,
     .detect_antidebug    = 1,
     .json_output         = 1,
@@ -45,7 +43,13 @@ struct tracer_config g_config = {
 struct tracer_stats g_stats = {0};
 
 /* --------------------------------------------------------------------------
- * syscall 号定义 (与 hook_engine.c 一致)
+ * 递归保护: 防止 hook 回调中的操作触发其他被 hook 的 syscall
+ * 使用一个简单的 per-thread 标记来防止递归
+ * -------------------------------------------------------------------------- */
+static int g_in_hook = 0;  /* 简化版: 全局递归标记 */
+
+/* --------------------------------------------------------------------------
+ * syscall 号定义
  * -------------------------------------------------------------------------- */
 #define __NR_eventfd2       19
 #define __NR_epoll_create1  20
@@ -94,14 +98,11 @@ struct tracer_stats g_stats = {0};
 #define __NR_wait4          260
 #define __NR_renameat2      276
 
-/* prctl 选项常量 */
 #define PR_SET_DUMPABLE     4
-
-/* 信号常量 */
 #define SIGTRAP             5
 
 /* --------------------------------------------------------------------------
- * get_syscall_name - 获取 syscall 名称
+ * get_syscall_name
  * -------------------------------------------------------------------------- */
 const char *get_syscall_name(int nr)
 {
@@ -156,82 +157,46 @@ const char *get_syscall_name(int nr)
     }
 }
 
-/* --------------------------------------------------------------------------
- * get_syscall_category - 获取 syscall 类别掩码
- * -------------------------------------------------------------------------- */
 unsigned char get_syscall_category(int nr)
 {
     switch (nr) {
-    /* 文件操作 */
     case __NR_openat: case __NR_close: case __NR_read: case __NR_write:
     case __NR_readv: case __NR_writev: case __NR_lseek: case __NR_fstat:
     case __NR_ioctl: case __NR_dup: case __NR_dup3: case __NR_pipe2:
     case __NR_readlinkat: case __NR_faccessat: case __NR_unlinkat:
     case __NR_mkdirat: case __NR_renameat2:
         return SC_CAT_FILE;
-
-    /* 进程操作 */
     case __NR_execve: case __NR_clone: case __NR_wait4:
     case __NR_exit_group: case __NR_getpid: case __NR_getuid:
     case __NR_prctl: case __NR_setpgid:
         return SC_CAT_PROC;
-
-    /* 内存操作 */
     case __NR_mmap: case __NR_munmap: case __NR_mprotect:
     case __NR_madvise: case __NR_mremap:
         return SC_CAT_MEM;
-
-    /* 网络操作 */
     case __NR_socket: case __NR_connect: case __NR_bind:
     case __NR_listen: case __NR_accept4: case __NR_sendto:
     case __NR_recvfrom: case __NR_setsockopt: case __NR_getsockname:
         return SC_CAT_NET;
-
-    /* 信号操作 */
     case __NR_rt_sigaction: case __NR_kill: case __NR_tgkill:
         return SC_CAT_SIGNAL;
-
-    /* 反调试 */
     case __NR_ptrace:
         return SC_CAT_ANTIDEBUG;
-
-    /* IPC */
     case __NR_epoll_create1: case __NR_epoll_ctl: case __NR_eventfd2:
         return SC_CAT_IPC;
-
     default:
         return 0;
     }
 }
 
-static inline int task_get_pid(struct task_struct *task)
-{
-    return *(int *)((uintptr_t)task + task_struct_offset.pid_offset);
-}
-
-static inline int task_get_tgid(struct task_struct *task)
-{
-    return *(int *)((uintptr_t)task + task_struct_offset.tgid_offset);
-}
-
-static inline unsigned int task_get_uid(struct task_struct *task)
-{
-    const struct cred *cred = *(const struct cred **)((uintptr_t)task + task_struct_offset.cred_offset);
-    const kuid_t *uid = (const kuid_t *)((uintptr_t)cred + cred_offset.uid_offset);
-    return uid->val;
-}
-
 /* --------------------------------------------------------------------------
- * should_monitor - 多级过滤判断
- * --------------------------------------------------------------------------
- * 过滤优先级: PID列表 -> UID -> comm -> package
- * 返回: 1=应该监控, 0=应该跳过
+ * should_monitor - 多级过滤
+ * 修复: 包名过滤仅使用缓存, 不在 hook 上下文中执行文件 I/O
  * -------------------------------------------------------------------------- */
 static int should_monitor(int tgid, unsigned int uid, const char *comm)
 {
     int i;
 
-    /* 1. PID 列表过滤 (如果设置了 PID 列表, 只监控列表中的进程) */
+    /* 1. PID 列表过滤 */
     if (g_config.pid_count > 0) {
         int found = 0;
         for (i = 0; i < g_config.pid_count; i++) {
@@ -256,20 +221,19 @@ static int should_monitor(int tgid, unsigned int uid, const char *comm)
             return 0;
     }
 
-    /* 4. 包名过滤 (通过 UID 间接过滤) */
+    /* 4. 包名过滤 (仅查缓存, 不执行文件 I/O) */
     if (g_config.filter_pkg[0] != '\0' && g_config.filter_uid < 0) {
-        /*
-         * 包名过滤但未设置 UID:
-         * 尝试解析当前 UID 对应的包名进行匹配
-         */
         char pkg_buf[MAX_PKG_LEN];
+        /*
+         * 修复: pkg_resolve_uid_to_pkg 现在只查内存缓存,
+         * 不会在 hook 上下文中执行文件 I/O。
+         * 包名映射由用户空间通过 CTL0 的 pkg_add 命令预先注入。
+         */
         if (pkg_resolve_uid_to_pkg(uid, pkg_buf, MAX_PKG_LEN) == 0) {
             if (strncmp(pkg_buf, g_config.filter_pkg, MAX_PKG_LEN) != 0)
                 return 0;
-        } else {
-            /* 无法解析包名, 跳过 */
-            return 0;
         }
+        /* 缓存未命中时不过滤, 允许通过 (宁可多记录, 不要漏记录) */
     }
 
     return 1;
@@ -277,95 +241,74 @@ static int should_monitor(int tgid, unsigned int uid, const char *comm)
 
 /* --------------------------------------------------------------------------
  * is_antidebug_behavior - 反调试行为检测
- * --------------------------------------------------------------------------
- * 检测以下行为模式:
- * 1. ptrace 调用 (直接反调试)
- * 2. 访问 /proc/self/status, maps, mem, wchan, task, fd
- * 3. 检测 frida, magisk, su 字符串
- * 4. prctl PR_SET_DUMPABLE 0
- * 5. rt_sigaction SIGTRAP
- * 6. openat 访问 /proc/self/fd (遍历文件描述符)
+ * 修复: 增加 kfunc_copy_from_user 空指针检查
  * -------------------------------------------------------------------------- */
 static int is_antidebug_behavior(int nr, unsigned long *args)
 {
-    /* ptrace 调用 */
     if (nr == __NR_ptrace)
         return 1;
 
-    /* prctl PR_SET_DUMPABLE 0 */
     if (nr == __NR_prctl) {
         if (args[0] == PR_SET_DUMPABLE && args[1] == 0)
             return 1;
     }
 
-    /* rt_sigaction SIGTRAP */
     if (nr == __NR_rt_sigaction) {
         if ((int)args[0] == SIGTRAP)
             return 1;
     }
 
-    /* 文件访问类反调试检测 */
     if (nr == __NR_openat || nr == __NR_faccessat || nr == __NR_readlinkat) {
-        /*
-         * args[1] 是路径指针 (用户空间地址)
-         * 安全读取路径字符串进行检查
-         */
         char path_buf[256];
         unsigned long path_addr = args[1];
 
         if (path_addr == 0)
             return 0;
 
-        /* 安全读取用户空间字符串 */
+        /* 修复: 必须检查 kfunc_copy_from_user 非 NULL */
+        if (!kfunc_copy_from_user)
+            return 0;
+
         memset(path_buf, 0, sizeof(path_buf));
-        if (kfunc_copy_from_user && kfunc_copy_from_user(
-                path_buf, (const void __user *)path_addr, 255) != 0) {
-            return 0; /* 读取失败,不判定 */
-        }
+        if (kfunc_copy_from_user(path_buf, (const void __user *)path_addr, 255) != 0)
+            return 0;
         path_buf[255] = '\0';
 
-        /* /proc/self/ 相关检测 */
         if (strstr(path_buf, "/proc/self/status") ||
             strstr(path_buf, "/proc/self/maps") ||
             strstr(path_buf, "/proc/self/mem") ||
             strstr(path_buf, "/proc/self/wchan") ||
             strstr(path_buf, "/proc/self/task") ||
-            strstr(path_buf, "/proc/self/fd")) {
+            strstr(path_buf, "/proc/self/fd"))
             return 1;
-        }
 
-        /* frida 检测 */
         if (strstr(path_buf, "frida") ||
             strstr(path_buf, "linjector") ||
-            strstr(path_buf, "gadget")) {
+            strstr(path_buf, "gadget"))
             return 1;
-        }
 
-        /* magisk / su 检测 */
         if (strstr(path_buf, "magisk") ||
             strstr(path_buf, "/su") ||
             strstr(path_buf, "/sbin/su") ||
-            strstr(path_buf, "supersu")) {
+            strstr(path_buf, "supersu"))
             return 1;
-        }
     }
 
     return 0;
 }
 
 /* --------------------------------------------------------------------------
- * safe_strncpy_from_user - 安全读取用户空间字符串
+ * safe_strncpy_from_user
  * -------------------------------------------------------------------------- */
 static int safe_strncpy_from_user(char *dst, unsigned long user_addr, int maxlen)
 {
-    if (user_addr == 0 || maxlen <= 0) {
+    if (user_addr == 0 || maxlen <= 0 || !kfunc_copy_from_user) {
         dst[0] = '\0';
         return 0;
     }
 
     memset(dst, 0, maxlen);
-    if (kfunc_copy_from_user &&
-        kfunc_copy_from_user(dst, (const void __user *)user_addr, maxlen - 1) != 0) {
+    if (kfunc_copy_from_user(dst, (const void __user *)user_addr, maxlen - 1) != 0) {
         dst[0] = '\0';
         return -1;
     }
@@ -374,22 +317,20 @@ static int safe_strncpy_from_user(char *dst, unsigned long user_addr, int maxlen
 }
 
 /* --------------------------------------------------------------------------
- * parse_args - 为各系统调用解析参数到 detail 字符串
+ * parse_args - 参数解析 (精简版, 只解析最常用的 syscall)
  * -------------------------------------------------------------------------- */
 static void parse_args(int nr, unsigned long *args, long retval,
                         char *detail, int detail_len)
 {
     char path_buf[128];
-
     detail[0] = '\0';
 
     switch (nr) {
-    /* === 文件操作 === */
     case __NR_openat:
         safe_strncpy_from_user(path_buf, args[1], sizeof(path_buf));
         snprintf(detail, detail_len,
-                 "dirfd=%ld path=\"%s\" flags=0x%lx mode=0%lo",
-                 (long)args[0], path_buf, args[2], args[3]);
+                 "dirfd=%ld path=\"%s\" flags=0x%lx",
+                 (long)args[0], path_buf, args[2]);
         break;
 
     case __NR_close:
@@ -397,135 +338,33 @@ static void parse_args(int nr, unsigned long *args, long retval,
         break;
 
     case __NR_read:
-        snprintf(detail, detail_len, "fd=%ld buf=0x%lx count=%lu",
-                 (long)args[0], args[1], args[2]);
+        snprintf(detail, detail_len, "fd=%ld count=%lu",
+                 (long)args[0], args[2]);
         break;
 
     case __NR_write:
-        snprintf(detail, detail_len, "fd=%ld buf=0x%lx count=%lu",
-                 (long)args[0], args[1], args[2]);
-        break;
-
-    case __NR_readv:
-        snprintf(detail, detail_len, "fd=%ld iov=0x%lx iovcnt=%lu",
-                 (long)args[0], args[1], args[2]);
-        break;
-
-    case __NR_writev:
-        snprintf(detail, detail_len, "fd=%ld iov=0x%lx iovcnt=%lu",
-                 (long)args[0], args[1], args[2]);
-        break;
-
-    case __NR_lseek:
-        snprintf(detail, detail_len, "fd=%ld offset=%ld whence=%ld",
-                 (long)args[0], (long)args[1], (long)args[2]);
-        break;
-
-    case __NR_fstat:
-        snprintf(detail, detail_len, "fd=%ld statbuf=0x%lx",
-                 (long)args[0], args[1]);
+        snprintf(detail, detail_len, "fd=%ld count=%lu",
+                 (long)args[0], args[2]);
         break;
 
     case __NR_ioctl:
-        snprintf(detail, detail_len, "fd=%ld cmd=0x%lx arg=0x%lx",
-                 (long)args[0], args[1], args[2]);
+        snprintf(detail, detail_len, "fd=%ld cmd=0x%lx",
+                 (long)args[0], args[1]);
         break;
 
-    case __NR_dup:
-        snprintf(detail, detail_len, "oldfd=%ld", (long)args[0]);
-        break;
-
-    case __NR_dup3:
-        snprintf(detail, detail_len, "oldfd=%ld newfd=%ld flags=0x%lx",
-                 (long)args[0], (long)args[1], args[2]);
-        break;
-
-    case __NR_pipe2:
-        snprintf(detail, detail_len, "pipefd=0x%lx flags=0x%lx",
-                 args[0], args[1]);
-        break;
-
-    case __NR_readlinkat:
-        safe_strncpy_from_user(path_buf, args[1], sizeof(path_buf));
-        snprintf(detail, detail_len, "dirfd=%ld path=\"%s\" bufsiz=%lu",
-                 (long)args[0], path_buf, args[3]);
-        break;
-
-    case __NR_faccessat:
-        safe_strncpy_from_user(path_buf, args[1], sizeof(path_buf));
-        snprintf(detail, detail_len, "dirfd=%ld path=\"%s\" mode=%ld",
-                 (long)args[0], path_buf, (long)args[2]);
-        break;
-
-    case __NR_unlinkat:
-        safe_strncpy_from_user(path_buf, args[1], sizeof(path_buf));
-        snprintf(detail, detail_len, "dirfd=%ld path=\"%s\" flags=0x%lx",
-                 (long)args[0], path_buf, args[2]);
-        break;
-
-    case __NR_mkdirat:
-        safe_strncpy_from_user(path_buf, args[1], sizeof(path_buf));
-        snprintf(detail, detail_len, "dirfd=%ld path=\"%s\" mode=0%lo",
-                 (long)args[0], path_buf, args[2]);
-        break;
-
-    case __NR_renameat2:
-        safe_strncpy_from_user(path_buf, args[1], sizeof(path_buf));
-        snprintf(detail, detail_len,
-                 "olddirfd=%ld oldpath=\"%s\" newdirfd=%ld flags=0x%lx",
-                 (long)args[0], path_buf, (long)args[2], args[4]);
-        break;
-
-    /* === 进程操作 === */
     case __NR_execve:
         safe_strncpy_from_user(path_buf, args[0], sizeof(path_buf));
-        snprintf(detail, detail_len,
-                 "filename=\"%s\" argv=0x%lx envp=0x%lx",
-                 path_buf, args[1], args[2]);
+        snprintf(detail, detail_len, "filename=\"%s\"", path_buf);
         break;
 
     case __NR_clone:
-        snprintf(detail, detail_len,
-                 "flags=0x%lx stack=0x%lx ptid=0x%lx tls=0x%lx ctid=0x%lx",
-                 args[0], args[1], args[2], args[3], args[4]);
+        snprintf(detail, detail_len, "flags=0x%lx", args[0]);
         break;
 
-    case __NR_wait4:
-        snprintf(detail, detail_len,
-                 "pid=%ld stat_addr=0x%lx options=0x%lx rusage=0x%lx",
-                 (long)args[0], args[1], args[2], args[3]);
-        break;
-
-    case __NR_exit_group:
-        snprintf(detail, detail_len, "status=%ld", (long)args[0]);
-        break;
-
-    case __NR_prctl:
-        snprintf(detail, detail_len,
-                 "option=%ld arg2=0x%lx arg3=0x%lx arg4=0x%lx arg5=0x%lx",
-                 (long)args[0], args[1], args[2], args[3], args[4]);
-        break;
-
-    case __NR_setpgid:
-        snprintf(detail, detail_len, "pid=%ld pgid=%ld",
-                 (long)args[0], (long)args[1]);
-        break;
-
-    case __NR_getpid:
-    case __NR_getuid:
-        snprintf(detail, detail_len, "ret=%ld", retval);
-        break;
-
-    /* === 内存操作 === */
     case __NR_mmap:
         snprintf(detail, detail_len,
-                 "addr=0x%lx len=%lu prot=0x%lx flags=0x%lx fd=%ld off=0x%lx",
-                 args[0], args[1], args[2], args[3], (long)args[4], args[5]);
-        break;
-
-    case __NR_munmap:
-        snprintf(detail, detail_len, "addr=0x%lx len=%lu",
-                 args[0], args[1]);
+                 "addr=0x%lx len=%lu prot=0x%lx flags=0x%lx fd=%ld",
+                 args[0], args[1], args[2], args[3], (long)args[4]);
         break;
 
     case __NR_mprotect:
@@ -533,78 +372,19 @@ static void parse_args(int nr, unsigned long *args, long retval,
                  args[0], args[1], args[2]);
         break;
 
-    case __NR_madvise:
-        snprintf(detail, detail_len, "addr=0x%lx len=%lu advice=%ld",
-                 args[0], args[1], (long)args[2]);
-        break;
-
-    case __NR_mremap:
-        snprintf(detail, detail_len,
-                 "old_addr=0x%lx old_size=%lu new_size=%lu flags=0x%lx new_addr=0x%lx",
-                 args[0], args[1], args[2], args[3], args[4]);
-        break;
-
-    /* === 网络操作 === */
     case __NR_socket:
-        snprintf(detail, detail_len, "domain=%ld type=%ld protocol=%ld",
-                 (long)args[0], (long)args[1], (long)args[2]);
-        break;
-
-    case __NR_connect:
-        snprintf(detail, detail_len, "sockfd=%ld addr=0x%lx addrlen=%lu",
-                 (long)args[0], args[1], args[2]);
-        break;
-
-    case __NR_bind:
-        snprintf(detail, detail_len, "sockfd=%ld addr=0x%lx addrlen=%lu",
-                 (long)args[0], args[1], args[2]);
-        break;
-
-    case __NR_listen:
-        snprintf(detail, detail_len, "sockfd=%ld backlog=%ld",
+        snprintf(detail, detail_len, "domain=%ld type=%ld",
                  (long)args[0], (long)args[1]);
         break;
 
-    case __NR_accept4:
-        snprintf(detail, detail_len,
-                 "sockfd=%ld addr=0x%lx addrlen=0x%lx flags=0x%lx",
-                 (long)args[0], args[1], args[2], args[3]);
+    case __NR_connect:
+        snprintf(detail, detail_len, "sockfd=%ld addr=0x%lx",
+                 (long)args[0], args[1]);
         break;
 
-    case __NR_sendto:
-        snprintf(detail, detail_len,
-                 "sockfd=%ld buf=0x%lx len=%lu flags=0x%lx dest=0x%lx addrlen=%lu",
-                 (long)args[0], args[1], args[2], args[3], args[4], args[5]);
-        break;
-
-    case __NR_recvfrom:
-        snprintf(detail, detail_len,
-                 "sockfd=%ld buf=0x%lx len=%lu flags=0x%lx src=0x%lx addrlen=0x%lx",
-                 (long)args[0], args[1], args[2], args[3], args[4], args[5]);
-        break;
-
-    case __NR_setsockopt:
-        snprintf(detail, detail_len,
-                 "sockfd=%ld level=%ld optname=%ld optval=0x%lx optlen=%lu",
-                 (long)args[0], (long)args[1], (long)args[2], args[3], args[4]);
-        break;
-
-    case __NR_getsockname:
-        snprintf(detail, detail_len, "sockfd=%ld addr=0x%lx addrlen=0x%lx",
-                 (long)args[0], args[1], args[2]);
-        break;
-
-    /* === 信号/调试操作 === */
     case __NR_ptrace:
-        snprintf(detail, detail_len,
-                 "request=%ld pid=%ld addr=0x%lx data=0x%lx",
-                 (long)args[0], (long)args[1], args[2], args[3]);
-        break;
-
-    case __NR_rt_sigaction:
-        snprintf(detail, detail_len,
-                 "signum=%ld act=0x%lx oldact=0x%lx sigsetsize=%lu",
-                 (long)args[0], args[1], args[2], args[3]);
+        snprintf(detail, detail_len, "request=%ld pid=%ld",
+                 (long)args[0], (long)args[1]);
         break;
 
     case __NR_kill:
@@ -612,82 +392,81 @@ static void parse_args(int nr, unsigned long *args, long retval,
                  (long)args[0], (long)args[1]);
         break;
 
-    case __NR_tgkill:
-        snprintf(detail, detail_len, "tgid=%ld tid=%ld sig=%ld",
-                 (long)args[0], (long)args[1], (long)args[2]);
+    case __NR_prctl:
+        snprintf(detail, detail_len, "option=%ld arg2=0x%lx",
+                 (long)args[0], args[1]);
         break;
 
-    /* === IPC 操作 === */
-    case __NR_epoll_create1:
-        snprintf(detail, detail_len, "flags=0x%lx", args[0]);
+    case __NR_readlinkat:
+        safe_strncpy_from_user(path_buf, args[1], sizeof(path_buf));
+        snprintf(detail, detail_len, "path=\"%s\"", path_buf);
         break;
 
-    case __NR_epoll_ctl:
-        snprintf(detail, detail_len, "epfd=%ld op=%ld fd=%ld event=0x%lx",
-                 (long)args[0], (long)args[1], (long)args[2], args[3]);
-        break;
-
-    case __NR_eventfd2:
-        snprintf(detail, detail_len, "initval=%lu flags=0x%lx",
-                 args[0], args[1]);
+    case __NR_faccessat:
+        safe_strncpy_from_user(path_buf, args[1], sizeof(path_buf));
+        snprintf(detail, detail_len, "path=\"%s\" mode=%ld",
+                 path_buf, (long)args[2]);
         break;
 
     default:
-        snprintf(detail, detail_len, "arg0=0x%lx arg1=0x%lx arg2=0x%lx",
-                 args[0], args[1], args[2]);
+        snprintf(detail, detail_len, "arg0=0x%lx arg1=0x%lx",
+                 args[0], args[1]);
         break;
     }
 }
 
 /* ============================================================================
- * syscall_monitor_init - 初始化监控器
+ * syscall_monitor_init
  * ============================================================================ */
 int syscall_monitor_init(void)
 {
-    /* 配置已在声明时初始化, 此处清零统计 */
     memset(&g_stats, 0, sizeof(g_stats));
+    g_in_hook = 0;
     pr_info("[svc-tracer] syscall monitor initialized\n");
     return 0;
 }
 
 /* ============================================================================
- * syscall_monitor_on_syscall - 主入口, 由 hook 回调调用
+ * syscall_monitor_on_syscall - 主入口 (修复版)
  * ============================================================================
- * 参数:
- *   nr     - 系统调用号
- *   args   - 系统调用参数数组 (6个元素)
- *   retval - 返回值
- *   narg   - 实际参数数量
+ * 关键修复:
+ * 1. 使用 safe_get_xxx() 获取进程信息, 不依赖未定义的偏移量
+ * 2. 使用堆分配 svc_event, 避免栈溢出
+ * 3. 添加递归保护
  * ============================================================================ */
 void syscall_monitor_on_syscall(int nr, unsigned long *args,
                                  long retval, int narg)
 {
-    struct svc_event event;
+    struct svc_event *event;
     int tgid, tid;
     unsigned int uid;
     unsigned char cat;
+    const char *comm;
 
     /* 检查运行状态 */
     if (!g_config.running)
         return;
 
-    /* 获取当前进程信息 */
-    tgid = task_get_tgid(current);
-    tid = task_get_pid(current);
+    /* 递归保护: 防止 hook 回调中的操作再次触发 hook */
+    if (g_in_hook)
+        return;
+    g_in_hook = 1;
 
-    /* 获取 UID: 通过 current->cred->uid.val */
-    uid = task_get_uid(current);
-
-    /* 获取 syscall 类别 */
-    cat = get_syscall_category(nr);
+    /* 修复: 使用安全的内联函数获取进程信息 */
+    tgid = safe_get_tgid();
+    tid  = safe_get_tid();
+    uid  = safe_get_uid();
+    comm = safe_get_task_comm();
 
     /* 类别过滤 */
+    cat = get_syscall_category(nr);
     if (cat != 0 && !(cat & g_config.category_mask)) {
         g_stats.filtered_events++;
+        g_in_hook = 0;
         return;
     }
 
-    /* Syscall 号过滤 (如果设置了过滤列表, 只监控列表中的 syscall) */
+    /* Syscall 号过滤 */
     if (g_config.filtered_syscall_count > 0) {
         int i, found = 0;
         for (i = 0; i < g_config.filtered_syscall_count; i++) {
@@ -698,84 +477,95 @@ void syscall_monitor_on_syscall(int nr, unsigned long *args,
         }
         if (!found) {
             g_stats.filtered_events++;
+            g_in_hook = 0;
             return;
         }
     }
 
     /* 多级进程过滤 */
-    if (!should_monitor(tgid, uid, get_task_comm(current))) {
+    if (!should_monitor(tgid, uid, comm)) {
         g_stats.filtered_events++;
+        g_in_hook = 0;
         return;
     }
 
-    /* 构建事件 */
-    memset(&event, 0, sizeof(event));
+    /* 修复: 使用 kp_malloc 分配事件, 避免约 ~450 字节的栈分配 */
+    event = (struct svc_event *)kp_malloc(sizeof(struct svc_event));
+    if (!event) {
+        g_stats.dropped_events++;
+        g_in_hook = 0;
+        return;
+    }
+    memset(event, 0, sizeof(struct svc_event));
 
     /* 时间戳 */
     if (kfunc_ktime_get_ns)
-        event.timestamp_ns = kfunc_ktime_get_ns();
+        event->timestamp_ns = kfunc_ktime_get_ns();
 
     /* 进程信息 */
-    event.pid = tgid;
-    event.tid = tid;
-    event.uid = uid;
-    strncpy(event.comm, get_task_comm(current), MAX_COMM_LEN - 1);
+    event->pid = tgid;
+    event->tid = tid;
+    event->uid = uid;
+    strncpy(event->comm, comm, MAX_COMM_LEN - 1);
 
     /* 系统调用信息 */
-    event.syscall_nr = nr;
+    event->syscall_nr = nr;
     if (args) {
         int i;
-        for (i = 0; i < 6 && i < narg; i++)
-            event.args[i] = args[i];
+        int copy_count = (narg < 6) ? narg : 6;
+        for (i = 0; i < copy_count; i++)
+            event->args[i] = args[i];
     }
-    event.category = cat;
+    event->category = cat;
 
     /* 返回值 */
     if (g_config.capture_retval)
-        event.retval = retval;
+        event->retval = retval;
 
     /* 反调试检测 */
-    if (g_config.detect_antidebug) {
-        event.is_antidebug = is_antidebug_behavior(nr, args);
-        if (event.is_antidebug)
+    if (g_config.detect_antidebug && args) {
+        event->is_antidebug = is_antidebug_behavior(nr, args);
+        if (event->is_antidebug)
             g_stats.antidebug_events++;
     }
 
     /* 调用者信息 */
     if (g_config.capture_caller) {
-        caller_resolve(&event.caller_pc, &event.caller_lr,
-                        event.caller_module, &event.caller_offset);
+        caller_resolve(&event->caller_pc, &event->caller_lr,
+                        event->caller_module, &event->caller_offset);
 
-        /* 如果模块名为空, 尝试从 maps 缓存查询 */
-        if (event.caller_module[0] == '\0' && event.caller_pc != 0) {
-            maps_cache_lookup(tgid, event.caller_pc,
-                              event.caller_module, &event.caller_offset);
+        if (event->caller_module[0] == '\0' && event->caller_pc != 0) {
+            maps_cache_lookup(tgid, event->caller_pc,
+                              event->caller_module, &event->caller_offset);
         }
     }
 
-    /* 回溯栈 */
+    /* 回溯栈 (默认关闭, 性能敏感) */
     if (g_config.capture_backtrace) {
-        event.backtrace_depth = caller_backtrace(
-            event.backtrace, MAX_BACKTRACE_DEPTH);
+        event->backtrace_depth = caller_backtrace(
+            event->backtrace, MAX_BACKTRACE_DEPTH);
     }
 
     /* 参数解析 */
-    if (g_config.capture_args) {
-        parse_args(nr, args, retval, event.detail, MAX_DETAIL_LEN);
+    if (g_config.capture_args && args) {
+        parse_args(nr, args, retval, event->detail, MAX_DETAIL_LEN);
     }
 
     /* 写入环形缓冲区 */
     g_stats.total_events++;
-    if (event_logger_write(&event) < 0) {
+    if (event_logger_write(event) < 0) {
         g_stats.dropped_events++;
     }
 
     /* 文件日志 */
     if (g_config.file_log_enabled) {
-        if (file_logger_write_event(&event) == 0) {
+        if (file_logger_write_event(event) == 0) {
             g_stats.file_log_writes++;
         } else {
             g_stats.file_log_errors++;
         }
     }
+
+    kp_free(event);
+    g_in_hook = 0;
 }

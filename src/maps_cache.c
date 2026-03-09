@@ -1,10 +1,10 @@
 /* ============================================================================
- * maps_cache.c - 进程地址映射缓存实现
+ * maps_cache.c - 进程地址映射缓存 (修复版)
  * ============================================================================
- * 版本: 3.0.0
- * 描述: 多进程 LRU 缓存, 缓存 /proc/pid/maps 解析结果
- *       用于将用户空间地址解析为模块名和偏移量
- *       支持最多 8 个进程同时缓存
+ * 版本: 3.1.0
+ * 修复: 1. 移除 maps_cache_refresh 中的文件 I/O (不安全)
+ *       2. 改为通过 CTL0 接口由用户空间传入 maps 数据
+ *       3. maps_cache_update_from_string 解析用户空间传入的文本
  * ============================================================================ */
 
 #include <compiler.h>
@@ -15,7 +15,6 @@
 #include <linux/kernel.h>
 #include <kpmalloc.h>
 #include "svc_tracer.h"
-#include "maps_cache.h"
 
 /* --------------------------------------------------------------------------
  * 全局缓存
@@ -25,10 +24,8 @@ static unsigned long long g_access_counter = 0;
 static spinlock_t g_maps_lock;
 
 /* --------------------------------------------------------------------------
- * 简单行解析辅助函数
+ * 辅助函数
  * -------------------------------------------------------------------------- */
-
-/* 解析十六进制字符串到 unsigned long */
 static unsigned long parse_hex(const char *s, const char **endp)
 {
     unsigned long val = 0;
@@ -48,7 +45,6 @@ static unsigned long parse_hex(const char *s, const char **endp)
     return val;
 }
 
-/* 跳到下一个空白字符 */
 static const char *skip_to_space(const char *s)
 {
     while (*s && *s != ' ' && *s != '\t')
@@ -56,7 +52,6 @@ static const char *skip_to_space(const char *s)
     return s;
 }
 
-/* 跳过空白字符 */
 static const char *skip_whitespace(const char *s)
 {
     while (*s == ' ' || *s == '\t')
@@ -64,44 +59,48 @@ static const char *skip_whitespace(const char *s)
     return s;
 }
 
+static const char *skip_to_newline(const char *s)
+{
+    while (*s && *s != '\n')
+        s++;
+    return s;
+}
+
 /* --------------------------------------------------------------------------
- * parse_maps_line - 解析一行 /proc/pid/maps
- * --------------------------------------------------------------------------
- * 格式: start-end perms offset dev inode pathname
- * 例如: 7f8b000000-7f8b001000 r-xp 00000000 fd:01 12345 /lib/libc.so
+ * parse_maps_line - 解析 /proc/pid/maps 的一行
  * -------------------------------------------------------------------------- */
 static int parse_maps_line(const char *line, struct maps_entry *entry)
 {
     const char *p = line;
     const char *endp;
 
-    /* 解析 start */
+    /* start */
     entry->start = parse_hex(p, &endp);
     if (*endp != '-') return -1;
     p = endp + 1;
 
-    /* 解析 end */
+    /* end */
     entry->end = parse_hex(p, &endp);
     p = endp;
 
-    /* 跳过 perms */
+    /* perms */
     p = skip_whitespace(p);
     p = skip_to_space(p);
 
-    /* 解析 offset */
+    /* offset */
     p = skip_whitespace(p);
     entry->offset = parse_hex(p, &endp);
     p = endp;
 
-    /* 跳过 dev */
+    /* dev */
     p = skip_whitespace(p);
     p = skip_to_space(p);
 
-    /* 跳过 inode */
+    /* inode */
     p = skip_whitespace(p);
     p = skip_to_space(p);
 
-    /* 解析 pathname */
+    /* pathname */
     p = skip_whitespace(p);
     entry->name[0] = '\0';
 
@@ -117,7 +116,7 @@ static int parse_maps_line(const char *line, struct maps_entry *entry)
 }
 
 /* --------------------------------------------------------------------------
- * find_cache_slot - 查找进程的缓存槽位
+ * find_cache_slot
  * -------------------------------------------------------------------------- */
 static struct maps_proc_cache *find_cache_slot(int tgid)
 {
@@ -130,7 +129,7 @@ static struct maps_proc_cache *find_cache_slot(int tgid)
 }
 
 /* --------------------------------------------------------------------------
- * maps_cache_evict_lru - LRU 驱逐, 返回最久未使用的槽位
+ * maps_cache_evict_lru
  * -------------------------------------------------------------------------- */
 static struct maps_proc_cache *maps_cache_evict_lru(void)
 {
@@ -138,13 +137,11 @@ static struct maps_proc_cache *maps_cache_evict_lru(void)
     int lru_idx = 0;
     unsigned long long min_access = g_cache[0].access_counter;
 
-    /* 先找空闲槽位 */
     for (i = 0; i < MAX_MAPS_CACHE_PROCS; i++) {
         if (g_cache[i].tgid == 0)
             return &g_cache[i];
     }
 
-    /* 找最久未使用的 */
     for (i = 1; i < MAX_MAPS_CACHE_PROCS; i++) {
         if (g_cache[i].access_counter < min_access) {
             min_access = g_cache[i].access_counter;
@@ -152,15 +149,13 @@ static struct maps_proc_cache *maps_cache_evict_lru(void)
         }
     }
 
-    /* 清除被驱逐的缓存 */
     g_cache[lru_idx].tgid = 0;
     g_cache[lru_idx].count = 0;
-
     return &g_cache[lru_idx];
 }
 
 /* ============================================================================
- * 公共接口实现
+ * 公共接口
  * ============================================================================ */
 
 int maps_cache_init(void)
@@ -183,9 +178,6 @@ void maps_cache_destroy(void)
     pr_info("[svc-tracer] maps_cache: destroyed\n");
 }
 
-/* ============================================================================
- * maps_cache_lookup - 查找地址对应的模块
- * ============================================================================ */
 int maps_cache_lookup(int tgid, unsigned long addr,
                        char *name_out, unsigned long *offset_out)
 {
@@ -204,10 +196,8 @@ int maps_cache_lookup(int tgid, unsigned long addr,
         return -1;
     }
 
-    /* 更新 LRU 访问计数 */
     pc->access_counter = ++g_access_counter;
 
-    /* 线性扫描查找匹配的地址区间 */
     for (i = 0; i < pc->count; i++) {
         struct maps_entry *e = &pc->entries[i];
         if (addr >= e->start && addr < e->end) {
@@ -227,34 +217,24 @@ int maps_cache_lookup(int tgid, unsigned long addr,
 }
 
 /* ============================================================================
- * maps_cache_refresh - 解析 /proc/pid/maps 并缓存
+ * maps_cache_update_from_string - 从用户空间传入的文本更新缓存
+ * ============================================================================
+ * 修复: 替代原来不安全的 maps_cache_refresh (在内核中读取 /proc 文件)
+ * 用户空间通过 CTL0 接口将 /proc/pid/maps 内容传入
  * ============================================================================ */
-int maps_cache_refresh(int tgid)
+int maps_cache_update_from_string(int tgid, const char *maps_data, int data_len)
 {
     unsigned long flags;
     struct maps_proc_cache *pc;
-    char path[64];
-    void *filp;
-    char *buf;
-    int buf_size = 64 * 1024; /* 64KB 读取缓冲区 */
+    const char *p;
+    const char *end;
+    int count = 0;
 
-    if (!kfunc_filp_open || !kfunc_filp_close)
+    if (!maps_data || data_len <= 0 || tgid <= 0)
         return -1;
 
-    /* 分配读取缓冲区 */
-    buf = (char *)kp_malloc(buf_size);
-    if (!buf)
-        return -1;
+    end = maps_data + data_len;
 
-    /* 打开 /proc/pid/maps */
-    snprintf(path, sizeof(path), "/proc/%d/maps", tgid);
-    filp = kfunc_filp_open(path, 0, 0); /* O_RDONLY */
-    if (!filp || (unsigned long)filp >= (unsigned long)(-4096)) {
-        kp_free(buf);
-        return -1;
-    }
-
-    /* 获取或分配缓存槽位 */
     flags = spin_lock_irqsave(&g_maps_lock);
 
     pc = find_cache_slot(tgid);
@@ -265,20 +245,35 @@ int maps_cache_refresh(int tgid)
     pc->count = 0;
     pc->access_counter = ++g_access_counter;
 
+    /* 逐行解析 */
+    p = maps_data;
+    while (p < end && count < MAX_MAPS_ENTRIES) {
+        struct maps_entry entry;
+
+        if (*p == '\n' || *p == '\0') {
+            p++;
+            continue;
+        }
+
+        if (parse_maps_line(p, &entry) == 0) {
+            /* 只缓存有名字的映射 (库文件等) */
+            if (entry.name[0] != '\0') {
+                memcpy(&pc->entries[count], &entry, sizeof(struct maps_entry));
+                count++;
+            }
+        }
+
+        /* 跳到下一行 */
+        p = skip_to_newline(p);
+        if (*p == '\n') p++;
+    }
+
+    pc->count = count;
+
     spin_unlock_irqrestore(&g_maps_lock, flags);
 
-    /*
-     * 注意: 在 KPM 环境中直接从内核读取 /proc 文件
-     * 需要通过 kernel_read 或等效 API。
-     * 实际部署时可通过用户空间辅助程序传入 maps 数据,
-     * 或使用 task->mm->mmap 直接遍历 VMA。
-     */
-
-    /* 清理 */
-    kfunc_filp_close(filp, NULL);
-    kp_free(buf);
-
-    return pc->count;
+    pr_info("[svc-tracer] maps_cache: updated pid %d, %d entries\n", tgid, count);
+    return count;
 }
 
 void maps_cache_invalidate(int tgid)

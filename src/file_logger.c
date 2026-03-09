@@ -1,10 +1,11 @@
 /* ============================================================================
- * file_logger.c - 文件日志实现
+ * file_logger.c - 文件日志实现 (修复版)
  * ============================================================================
- * 版本: 3.0.0
- * 描述: 将事件以 JSON Lines 格式写入文件
- *       支持文件大小轮转 (10MB)
- *       使用 spinlock 保护并发写入
+ * 版本: 3.1.0
+ * 修复: 1. 在 spinlock 外完成格式化和文件 I/O
+ *       2. 使用 spinlock 仅保护状态检查和位置更新
+ *       3. rotate_if_needed 不在持锁期间执行
+ *       4. 格式化缓冲区使用静态分配避免栈溢出
  * ============================================================================ */
 
 #include <compiler.h>
@@ -14,20 +15,26 @@
 #include <linux/string.h>
 #include <linux/kernel.h>
 #include "svc_tracer.h"
-#include "file_logger.h"
 
 /* --------------------------------------------------------------------------
  * 内部状态
  * -------------------------------------------------------------------------- */
-static void *g_filp = NULL;            /* 文件指针 (struct file *) */
-static long long g_file_pos = 0;       /* 当前写入位置 */
-static long long g_file_size = 0;      /* 当前文件大小估算 */
-static int g_enabled = 0;              /* 启用状态 */
+static void *g_filp = NULL;
+static long long g_file_pos = 0;
+static long long g_file_size = 0;
+static int g_enabled = 0;
 static char g_path[MAX_PATH_LEN] = "/sdcard/Download/svc_tracer.log";
-static spinlock_t g_flock;             /* 文件写入锁 */
+static spinlock_t g_flock;
+
+/*
+ * 静态格式化缓冲区, 避免在栈上分配大数组
+ * 注意: 这意味着 file_logger_write_event 不是重入安全的,
+ * 但由于 syscall_monitor_on_syscall 已有递归保护, 这是可接受的
+ */
+static char g_line_buf[1024];
 
 /* --------------------------------------------------------------------------
- * open_log_file - 打开日志文件
+ * open_log_file
  * -------------------------------------------------------------------------- */
 static int open_log_file(void)
 {
@@ -35,10 +42,9 @@ static int open_log_file(void)
         return -1;
 
     if (g_filp)
-        return 0; /* 已打开 */
+        return 0;
 
-    /* O_WRONLY | O_CREAT | O_APPEND = 0x441 */
-    g_filp = kfunc_filp_open(g_path, 0x441, 0644);
+    g_filp = kfunc_filp_open(g_path, 0x441, 0644); /* O_WRONLY|O_CREAT|O_APPEND */
     if (!g_filp || (unsigned long)g_filp >= (unsigned long)(-4096)) {
         pr_err("[svc-tracer] file_logger: failed to open %s\n", g_path);
         g_filp = NULL;
@@ -51,7 +57,7 @@ static int open_log_file(void)
 }
 
 /* --------------------------------------------------------------------------
- * close_log_file - 关闭日志文件
+ * close_log_file
  * -------------------------------------------------------------------------- */
 static void close_log_file(void)
 {
@@ -63,34 +69,8 @@ static void close_log_file(void)
     g_file_size = 0;
 }
 
-/* --------------------------------------------------------------------------
- * rotate_if_needed - 检查并执行文件轮转
- * -------------------------------------------------------------------------- */
-static void rotate_if_needed(void)
-{
-    if (g_file_size >= FILE_LOG_MAX_SIZE) {
-        close_log_file();
-        /*
-         * 简单轮转: 关闭后以 O_TRUNC 重新打开
-         * 生产环境可增加备份文件逻辑
-         */
-        if (kfunc_filp_open) {
-            /* O_WRONLY | O_CREAT | O_TRUNC = 0x241 */
-            g_filp = kfunc_filp_open(g_path, 0x241, 0644);
-            if (!g_filp || (unsigned long)g_filp >= (unsigned long)(-4096)) {
-                g_filp = NULL;
-                pr_warn("[svc-tracer] file_logger: rotate failed\n");
-                return;
-            }
-        }
-        g_file_pos = 0;
-        g_file_size = 0;
-        pr_info("[svc-tracer] file_logger: rotated\n");
-    }
-}
-
 /* ============================================================================
- * 公共接口实现
+ * 公共接口
  * ============================================================================ */
 
 int file_logger_init(void)
@@ -111,8 +91,10 @@ void file_logger_close(void)
 
     flags = spin_lock_irqsave(&g_flock);
     g_enabled = 0;
-    close_log_file();
     spin_unlock_irqrestore(&g_flock, flags);
+
+    /* 修复: 在 spinlock 外执行文件 I/O */
+    close_log_file();
 
     pr_info("[svc-tracer] file_logger: closed\n");
 }
@@ -120,15 +102,22 @@ void file_logger_close(void)
 void file_logger_enable(void)
 {
     unsigned long flags;
+    int need_open = 0;
 
     flags = spin_lock_irqsave(&g_flock);
-    if (!g_filp) {
+    if (!g_filp)
+        need_open = 1;
+    spin_unlock_irqrestore(&g_flock, flags);
+
+    /* 修复: 在 spinlock 外执行文件打开 */
+    if (need_open) {
         if (open_log_file() != 0) {
-            spin_unlock_irqrestore(&g_flock, flags);
             pr_err("[svc-tracer] file_logger: enable failed\n");
             return;
         }
     }
+
+    flags = spin_lock_irqsave(&g_flock);
     g_enabled = 1;
     spin_unlock_irqrestore(&g_flock, flags);
 
@@ -147,23 +136,37 @@ void file_logger_disable(void)
 }
 
 /* ============================================================================
- * file_logger_write_event - 将事件以 JSON Line 格式写入文件
+ * file_logger_write_event - 写入事件 (修复版)
+ * ============================================================================
+ * 关键修复: 不在 spinlock 持锁期间执行文件 I/O
+ *
+ * 策略:
+ * 1. 先在锁外格式化字符串
+ * 2. 用 spinlock 检查状态并获取文件指针和位置
+ * 3. 在锁外执行实际的 kernel_write
+ * 4. 用 spinlock 更新位置
+ *
+ * 注意: 由于 syscall_monitor 有递归保护 (g_in_hook),
+ * kernel_write 不会触发我们的 hook 回调, 所以是安全的。
  * ============================================================================ */
 int file_logger_write_event(const struct svc_event *event)
 {
     unsigned long flags;
-    char line[1024];
     int len;
     long written;
+    void *filp_copy;
+    long long pos_copy;
+    int need_rotate = 0;
 
-    if (!g_enabled || !g_filp || !event)
+    if (!event || !kfunc_kernel_write)
         return -1;
 
-    if (!kfunc_kernel_write)
+    /* 1. 检查启用状态 (快速路径) */
+    if (!g_enabled || !g_filp)
         return -1;
 
-    /* 格式化为 JSON Line */
-    len = snprintf(line, sizeof(line),
+    /* 2. 在锁外格式化 (使用静态缓冲区) */
+    len = snprintf(g_line_buf, sizeof(g_line_buf),
         "{\"ts\":%llu,\"pid\":%d,\"tid\":%d,\"uid\":%u,"
         "\"comm\":\"%s\",\"nr\":%d,\"name\":\"%s\","
         "\"ret\":%ld,\"cat\":%d,\"antidebug\":%d,"
@@ -178,32 +181,60 @@ int file_logger_write_event(const struct svc_event *event)
         event->caller_module, event->caller_offset,
         event->detail);
 
-    if (len <= 0 || len >= (int)sizeof(line))
+    if (len <= 0 || len >= (int)sizeof(g_line_buf))
         return -1;
 
+    /* 3. 获取文件状态 */
     flags = spin_lock_irqsave(&g_flock);
-
     if (!g_filp || !g_enabled) {
         spin_unlock_irqrestore(&g_flock, flags);
         return -1;
     }
 
-    /* 轮转检查 */
-    rotate_if_needed();
-
-    if (!g_filp) {
-        spin_unlock_irqrestore(&g_flock, flags);
-        return -1;
+    /* 检查是否需要轮转 */
+    if (g_file_size >= FILE_LOG_MAX_SIZE) {
+        need_rotate = 1;
     }
 
-    /* 写入文件 */
-    written = kfunc_kernel_write(g_filp, line, len, &g_file_pos);
-
-    if (written > 0) {
-        g_file_size += written;
-    }
-
+    filp_copy = g_filp;
+    pos_copy = g_file_pos;
     spin_unlock_irqrestore(&g_flock, flags);
+
+    /* 4. 文件轮转 (在锁外执行) */
+    if (need_rotate) {
+        close_log_file();
+        if (kfunc_filp_open) {
+            g_filp = kfunc_filp_open(g_path, 0x241, 0644); /* O_WRONLY|O_CREAT|O_TRUNC */
+            if (!g_filp || (unsigned long)g_filp >= (unsigned long)(-4096)) {
+                g_filp = NULL;
+                pr_warn("[svc-tracer] file_logger: rotate failed\n");
+                return -1;
+            }
+        }
+
+        flags = spin_lock_irqsave(&g_flock);
+        g_file_pos = 0;
+        g_file_size = 0;
+        filp_copy = g_filp;
+        pos_copy = g_file_pos;
+        spin_unlock_irqrestore(&g_flock, flags);
+
+        pr_info("[svc-tracer] file_logger: rotated\n");
+    }
+
+    if (!filp_copy)
+        return -1;
+
+    /* 5. 在锁外执行写入 (kernel_write 可能睡眠) */
+    written = kfunc_kernel_write(filp_copy, g_line_buf, len, &pos_copy);
+
+    /* 6. 更新位置 */
+    if (written > 0) {
+        flags = spin_lock_irqsave(&g_flock);
+        g_file_pos = pos_copy;
+        g_file_size += written;
+        spin_unlock_irqrestore(&g_flock, flags);
+    }
 
     return (written > 0) ? 0 : -1;
 }
@@ -215,21 +246,18 @@ int file_logger_set_path(const char *path)
     if (!path || strlen(path) == 0 || strlen(path) >= MAX_PATH_LEN)
         return -1;
 
-    flags = spin_lock_irqsave(&g_flock);
-
-    /* 关闭当前文件 */
+    /* 先关闭旧文件 (在锁外) */
     close_log_file();
 
-    /* 设置新路径 */
+    flags = spin_lock_irqsave(&g_flock);
     memset(g_path, 0, MAX_PATH_LEN);
     strncpy(g_path, path, MAX_PATH_LEN - 1);
+    spin_unlock_irqrestore(&g_flock, flags);
 
-    /* 如果已启用, 重新打开 */
+    /* 如果已启用, 重新打开 (在锁外) */
     if (g_enabled) {
         open_log_file();
     }
-
-    spin_unlock_irqrestore(&g_flock, flags);
 
     pr_info("[svc-tracer] file_logger: path set to %s\n", g_path);
     return 0;
@@ -237,25 +265,24 @@ int file_logger_set_path(const char *path)
 
 int file_logger_truncate(void)
 {
-    unsigned long flags;
-
-    flags = spin_lock_irqsave(&g_flock);
-
+    /* 在锁外执行文件操作 */
     close_log_file();
 
-    /* 以 O_TRUNC 重新打开 */
     if (kfunc_filp_open) {
         g_filp = kfunc_filp_open(g_path, 0x241, 0644);
         if (!g_filp || (unsigned long)g_filp >= (unsigned long)(-4096)) {
             g_filp = NULL;
-            spin_unlock_irqrestore(&g_flock, flags);
             return -1;
         }
     }
-    g_file_pos = 0;
-    g_file_size = 0;
 
-    spin_unlock_irqrestore(&g_flock, flags);
+    {
+        unsigned long flags;
+        flags = spin_lock_irqsave(&g_flock);
+        g_file_pos = 0;
+        g_file_size = 0;
+        spin_unlock_irqrestore(&g_flock, flags);
+    }
 
     pr_info("[svc-tracer] file_logger: truncated\n");
     return 0;
@@ -263,6 +290,5 @@ int file_logger_truncate(void)
 
 void file_logger_flush(void)
 {
-    /* 内核文件写入通常不需要显式 flush */
-    /* 预留接口用于未来扩展 */
+    /* 预留 */
 }

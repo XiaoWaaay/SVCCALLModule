@@ -1,7 +1,7 @@
 # 判断系统类型，Windows 和非 Windows 的区分
 ifeq ($(OS),Windows_NT)
     RM = del /Q
-    SEP = \\
+    SEP = \
     # 修正 Windows 上的 for 循环语法（双百分号 %%）
     FIND_REMOVE = for /r . %%x in (*.o) do del "%%x"
 else
@@ -47,19 +47,43 @@ SRCS += $(BASE_SRCS)
 OBJS := $(SRCS:.c=.o)
 OBJS := $(OBJS:.S=.o)
 
-all: module.kpm
+all: module.kpm svc-monitor.kpm
 
-push: module.kpm
-	adb push module.kpm /sdcard/Download
-
+# 构建原始 module.kpm
 module.kpm: ${OBJS}
 	${LD} -r -o $@ $^
 	$(FIND_REMOVE)
 
+# 构建新的 svc-monitor.kpm
+svc-monitor.kpm: 
+	$(MAKE) -C kpm TARGET_COMPILE=$(TARGET_COMPILE) KP_DIR=$(abspath $(KP_DIR))
+	cp kpm/svc-monitor.kpm .
+
+# 构建 Android APK
+apk: 
+	cd android && ./gradlew assembleDebug
+
+# 推送模块到设备
+push: module.kpm svc-monitor.kpm
+	adb push module.kpm /sdcard/Download
+	adb push svc-monitor.kpm /sdcard/Download
+
+# 推送 APK 到设备
+push-apk: apk
+	adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+
 %.o: %.c
 	${CC} $(CFLAGS) -c -o $@ $<
 
-.PHONY: clean
+.PHONY: clean clean-kpm clean-apk
+
 clean:
 	$(RM) *.kpm
 	$(FIND_REMOVE)
+	$(MAKE) -C kpm clean
+
+clean-kpm:
+	$(MAKE) -C kpm clean
+
+clean-apk:
+	cd android && ./gradlew clean
